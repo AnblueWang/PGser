@@ -1,60 +1,141 @@
-import json 
-import os
 import torch
-import torch.nn as nn
-from torch import optim
 import torch.nn.functional as F
-import csv
-import pandas as pd
-import re
-import unicodedata
-import itertools
 import random
 import config
-from data_utils import indexesFromSentence,normalizeString
+import numpy as np
 
-def evaluate(encoder, sec_encoder, decoder, searcher, voc, sentence, wikiSec):
-    max_length=config.MAX_LENGTH
-    ### Format input sentence as a batch
-    # words -> indexes
-    indexes_batch = [indexesFromSentence(voc, sentence)] #(1,L)
-    sec_indexes = [indexesFromSentence(voc,wikiSec)]
-    # Create lengths tensor
-    lengths = torch.tensor([len(indexes) for indexes in indexes_batch]) #(1,)
-    sec_lengths = torch.tensor([len(indexes) for indexes in sec_indexes])
-    # Transpose dimensions of batch to match models' expectations
-    input_batch = torch.LongTensor(indexes_batch).transpose(0, 1) #(L,1)
-    sec_batch = torch.LongTensor(sec_indexes).transpose(0, 1) 
-    # Use appropriate device
-    input_batch = input_batch.to(config.device)
-    sec_batch = sec_batch.to(config.device)
-    lengths = lengths.to(config.device)
-    sec_lengths = sec_lengths.to(config.device)
-    # Decode sentence with searcher
-    tokens, scores = searcher(input_batch, lengths, sec_batch, sec_lengths, max_length)
-    # indexes -> words
-    decoded_words = [voc.index2word[token] for token in tokens if not (token == config.EOS_token or token == config.PAD_token)]
-    return decoded_words
+from collections import Counter
+from nltk.translate import bleu_score
+from nltk.translate.bleu_score import SmoothingFunction
+from sklearn.metrics.pairwise import cosine_similarity
 
 
-def evaluateInput(encoder, sec_encoder, decoder, searcher, voc, wiki_strings):
-    input_sentence = ''
-    while(1):
+def bleu(hyps, refs):
+    """
+    bleu
+    """
+    bleu_1 = []
+    bleu_2 = []
+    for hyp, ref in zip(hyps, refs):
         try:
-            doc_idx = int(input('document index:'))
-            sec_idx = int(input('section index:'))
-            sec_sentence = wiki_strings[doc_idx][sec_idx]
-            # Get input sentence
-            input_sentence = input('> ')
-            # Check if it is quit case
-            if input_sentence == 'q' or input_sentence == 'quit': break
-            # Normalize sentence
-            input_sentence = normalizeString(input_sentence)
-            # Evaluate sentence
-            output_words = evaluate(encoder, sec_encoder, decoder, searcher, voc, input_sentence, sec_sentence)
-            # Format and print response sentence
-            output_words[:] = [x for x in output_words ]
-            print('Bot:', ' '.join(output_words))
+            score = bleu_score.sentence_bleu(
+                [ref], hyp,
+                smoothing_function=SmoothingFunction().method7,
+                weights=[1, 0, 0, 0])
+        except:
+            score = 0
+        bleu_1.append(score)
+        try:
+            score = bleu_score.sentence_bleu(
+                [ref], hyp,
+                smoothing_function=SmoothingFunction().method7,
+                weights=[0.5, 0.5, 0, 0])
+        except:
+            score = 0
+        bleu_2.append(score)
+    bleu_1 = np.average(bleu_1)
+    bleu_2 = np.average(bleu_2)
+    return bleu_1, bleu_2
 
-        except KeyError:
-            print("Error: Encountered unknown word.")
+
+def distinct(seqs):
+    """
+    distinct
+    """
+    batch_size = len(seqs)
+    intra_dist1, intra_dist2 = [], []
+    unigrams_all, bigrams_all = Counter(), Counter()
+    for seq in seqs:
+        unigrams = Counter(seq)
+        bigrams = Counter(zip(seq, seq[1:]))
+        intra_dist1.append((len(unigrams)+1e-12) / (len(seq)+1e-5))
+        intra_dist2.append((len(bigrams)+1e-12) / (max(0, len(seq)-1)+1e-5))
+
+        unigrams_all.update(unigrams)
+        bigrams_all.update(bigrams)
+
+    inter_dist1 = (len(unigrams_all)+1e-12) / (sum(unigrams_all.values())+1e-5)
+    inter_dist2 = (len(bigrams_all)+1e-12) / (sum(bigrams_all.values())+1e-5)
+    intra_dist1 = np.average(intra_dist1)
+    intra_dist2 = np.average(intra_dist2)
+    return intra_dist1, intra_dist2, inter_dist1, inter_dist2
+
+
+def evaluate_generation(generator,
+                        data_iter,
+                        vocab,
+                        save_file=None):
+    """
+    evaluate_generation
+    """
+    refs = []
+    hyps = []
+
+    for data in data_iter:
+        tokens, scores = generator(data)
+        truths = data[4].transpose(0,1).tolist()
+        for i,sent in enumerate(tokens):
+            prediction = [vocab.index2word[token] for token in sent if not (token == config.EOS_token or token == config.PAD_token)]
+            truth = [vocab.index2word[token] for token in truths[i] if not (token == config.EOS_token or token == config.PAD_token)]
+            refs.append(truth)
+            hyps.append(prediction)
+
+    report_message = []
+
+    avg_len = np.average([len(s) for s in hyps])
+    report_message.append("Avg_Len-{:.3f}".format(avg_len))
+
+    bleu_1, bleu_2 = bleu(hyps, refs)
+    report_message.append("Bleu-{:.4f}/{:.4f}".format(bleu_1, bleu_2))
+
+    intra_dist1, intra_dist2, inter_dist1, inter_dist2 = distinct(hyps)
+    report_message.append("Inter_Dist-{:.4f}/{:.4f}".format(inter_dist1, inter_dist2))
+
+    report_message = "   ".join(report_message)
+
+    intra_dist1, intra_dist2, inter_dist1, inter_dist2 = distinct(refs)
+    avg_len = np.average([len(s) for s in refs])
+    target_message = "Target:   AVG_LEN-{:.3f}   ".format(avg_len) + \
+        "Inter_Dist-{:.4f}/{:.4f}".format(inter_dist1, inter_dist2)
+
+    message = report_message + "\n" + target_message
+
+    if save_file is not None:
+        write_results(refs, hyps, save_file)
+        print("Saved generation results to '{}'".format(save_file))
+    print(message)
+
+
+def write_results(refs, hyps, results_file):
+    """
+    write_results
+    """
+    with open(results_file, "w", encoding="utf-8") as f:
+        for truth, prediction in zip(refs, hyps):
+            r = 'truth: '+' '.join(truth)+'\nprediction: '+' '.join(prediction)
+            f.write("{}\n".format(r))
+
+
+
+
+# def evaluateInput(encoder, sec_encoder, decoder, searcher, voc, wiki_strings):
+#     input_sentence = ''
+#     while(1):
+#         try:
+#             doc_idx = int(input('document index:'))
+#             sec_idx = int(input('section index:'))
+#             sec_sentence = wiki_strings[doc_idx][sec_idx]
+#             # Get input sentence
+#             input_sentence = input('> ')
+#             # Check if it is quit case
+#             if input_sentence == 'q' or input_sentence == 'quit': break
+#             # Normalize sentence
+#             input_sentence = normalizeString(input_sentence)
+#             # Evaluate sentence
+#             output_words = evaluate(encoder, sec_encoder, decoder, searcher, voc, input_sentence, sec_sentence)
+#             # Format and print response sentence
+#             output_words[:] = [x for x in output_words ]
+#             print('Bot:', ' '.join(output_words))
+
+#         except KeyError:
+#             print("Error: Encountered unknown word.")

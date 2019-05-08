@@ -6,12 +6,14 @@ from torch import optim
 import torch.nn.functional as F
 import csv
 import pandas as pd
+import shutil
 import re
 import unicodedata
 import itertools
+import time
 import random
-from data_utils import batchGenerator
 import config
+from evals import evaluate_generation
 
 def maskNLLLoss(inp, target, mask):
     nTotal = mask.sum()
@@ -20,139 +22,143 @@ def maskNLLLoss(inp, target, mask):
     loss = loss.to(config.device)
     return loss, nTotal.item()
 
-def train(input_variable, lengths, section_variable, sec_lengths, sec_idx, target_variable, mask, max_target_len, encoder, sec_encoder, decoder, embedding, encoder_optimizer, sec_encoder_optimizer, decoder_optimizer):
+def evaluate(model, data):
+    """
+    evaluate
+    """
+    model.eval()
+    ss = []
+    with torch.no_grad():
+        for data_batch in data:
+            if data_batch[0].shape[1] == config.batch_size:
+                avg_loss = model.iterate(data_batch=data_batch, is_training=False)
+                ss.append(avg_loss)
+    return sum(ss)/len(ss)
 
-    # Zero gradients
-    encoder_optimizer.zero_grad()
-    sec_encoder_optimizer.zero_grad()
-    decoder_optimizer.zero_grad()
+class Trainer(object):
+    """docstring for trainer"""
+    def __init__(self, model, optimizer, trainData, validData, vocab, num_epochs=1,
+        generator=None,save_dir=None, log_steps=None,valid_steps=None, 
+        grad_clip=None):
+        self.model = model
+        self.vocab = vocab
+        self.optimizer = optimizer
+        self.trainData = trainData
+        self.validData = validData
 
-    # Set device options
-    input_variable = input_variable.to(config.device)
-    lengths = lengths.to(config.device)
-    section_variable = section_variable.to(config.device)
-    sec_lengths = sec_lengths.to(config.device)
-    sec_idx = sec_idx.to(config.device)
-    target_variable = target_variable.to(config.device)
-    mask = mask.to(config.device)
+        self.generator = generator
+        self.save_dir = save_dir
+        self.log_steps = log_steps
+        self.valid_steps = valid_steps
+        self.grad_clip = grad_clip
+        self.num_epochs = num_epochs
+        self.epoch = 0
+        self.batch_num = 0
 
-    # Initialize variables
-    loss = 0
-    print_losses = []
-    n_totals = 0
+        self.train_start_message = "\n".join(["",
+                                              "=" * 85,
+                                              "=" * 34 + " Model Training " + "=" * 35,
+                                              "=" * 85,
+                                              ""])
+        self.valid_start_message = "\n" + "-" * 33 + " Model Evaulation " + "-" * 33
+
+    def train_epoch(self):
+        self.epoch += 1
+        num_batches = len(self.trainData)
+        print(self.train_start_message)
+
+        for batch_id, data_batch in enumerate(self.trainData,1):
+            if data_batch[0].shape[1] == config.batch_size:
+                self.model.train()
+                start_time = time.time()
+                avg_loss = self.model.iterate(data_batch,
+                                            optimizer=self.optimizer,
+                                            grad_clip=self.grad_clip,
+                                            is_training=True)
+                elapsed = time.time()-start_time
+                self.batch_num += 1
+
+                if batch_id % self.log_steps == 0:
+                    message_prefix = "[Train][{:2d}][{}/{}]".format(self.epoch, batch_id, num_batches)
+                    metrics_message = "Average Loss: "+str(avg_loss)
+                    message_posfix = "TIME-{:.2f}".format(elapsed)
+                    print("   ".join(
+                        [message_prefix, metrics_message, message_posfix]))
+
+                if batch_id % self.valid_steps == 0:
+                    print(self.valid_start_message)
+                    valid_loss = evaluate(self.model, self.validData)
+
+                    message_prefix = "[Valid][{:2d}][{}/{}]".format(self.epoch, batch_id, num_batches)
+                    metrics_message = "Valid Loss: "+str(valid_loss)
+                    print("   ".join([message_prefix, metrics_message]))
+
+                    if valid_loss < self.best_valid_loss:
+                        self.best_valid_loss = valid_loss
+                        self.save(True)
+                    print("-" * 85 + "\n")
+
+                    if self.generator is not None:
+                        print("Generation starts ...")
+                        gen_save_file = os.path.join(
+                            self.save_dir, "valid_{}.result").format(self.epoch)
+                        evaluate_generation(generator=self.generator,
+                                                               data_iter=self.validData,
+                                                               vocab=self.vocab,
+                                                               save_file=gen_save_file)
+                
+        self.save()
+
+    def train(self):
+        self.best_valid_loss = evaluate(self.model, self.validData)
+        print("Valid Loss: ", self.best_valid_loss)
+        for _ in range(self.epoch, self.num_epochs):
+            self.train_epoch()
+
+    def save(self, is_best=False):
+        model_file = os.path.join(
+            self.save_dir, "state_epoch_{}.model".format(self.epoch))
+        torch.save(self.model.state_dict(), model_file)
+        print("Saved model state to '{}'".format(model_file))
+
+        train_file = os.path.join(
+            self.save_dir, "state_epoch_{}.train".format(self.epoch))
+        train_state = {"epoch": self.epoch,
+                       "batch_num": self.batch_num,
+                       "best_valid_loss": self.best_valid_loss,
+                       "optimizer": self.optimizer.state_dict()}
+        torch.save(train_state, train_file)
+        print("Saved train state to '{}'".format(train_file))
+
+        if is_best:
+            best_model_file = os.path.join(self.save_dir, "best.model")
+            best_train_file = os.path.join(self.save_dir, "best.train")
+            shutil.copy(model_file, best_model_file)
+            shutil.copy(train_file, best_train_file)
+            print(
+                "Saved best model state to '{}' with new best valid loss {:.3f}".format(
+                    best_model_file, self.best_valid_loss))
+
+    def load(self, file_prefix):
+        """
+        load
+        """
+        model_file = "{}.model".format(file_prefix)
+        train_file = "{}.train".format(file_prefix)
+
+        model_state_dict = torch.load(
+            model_file, map_location=lambda storage, loc: storage)
+        self.model.load_state_dict(model_state_dict)
+        print("Loaded model state from '{}'".format(model_file))
+
+        train_state_dict = torch.load(
+            train_file, map_location=lambda storage, loc: storage)
+        self.epoch = train_state_dict["epoch"]
+        self.best_valid_loss = train_state_dict["best_valid_loss"]
+        self.batch_num = train_state_dict["batch_num"]
+        self.optimizer.load_state_dict(train_state_dict["optimizer"])
+
+        print(
+            "Loaded train state from '{}' with (epoch-{} best_valid_loss-{:.3f})".format(
+                train_file, self.epoch, self.best_valid_loss))
     
-    encoder_outputs, encoder_hidden = encoder(input_variable, lengths) # (L,B,H)  (layer*direc,B,H)
-    try:
-        # Forward pass through encoder
-        sec_outputs, sec_hidden = sec_encoder(section_variable, sec_lengths) # (secL,B,H)  (layer*direc,B,H)
-        sec_hidden = sec_hidden.index_select(1,sec_idx) #调整回按utter长度排序的batch内顺序
-    except Exception as e:
-        print(section_variable,section_variable.shape)
-        print(sec_lengths,sec_lengths.shape)
-        print(input_variable,input_variable.shape)
-        print(lengths,lengths.shape)
-        raise e
-
-    # Create initial decoder input (start with SOS tokens for each sentence)
-    decoder_input = torch.LongTensor([[config.SOS_token for _ in range(config.batch_size)]]) # (1,B)
-    decoder_input = decoder_input.to(config.device)
-
-    # Set initial decoder hidden state to the encoder's final hidden state
-    decoder_hidden = encoder_hidden[:decoder.n_layers] #（layer,B,H)
-
-    # Determine if we are using teacher forcing this iteration
-    use_teacher_forcing = True if random.random() < config.teacher_forcing_ratio else False
-
-    # Forward batch of sequences through decoder one time step at a time
-    if use_teacher_forcing:
-        for t in range(max_target_len):
-            decoder_output, decoder_hidden = decoder(
-                decoder_input, sec_hidden, decoder_hidden, encoder_outputs
-            )
-            # Teacher forcing: next input is current target
-            decoder_input = target_variable[t].view(1, -1)
-            # Calculate and accumulate loss
-            mask_loss, nTotal = maskNLLLoss(decoder_output, target_variable[t], mask[t])
-            loss += mask_loss
-            print_losses.append(mask_loss.item() * nTotal)
-            n_totals += nTotal
-    else:
-        for t in range(max_target_len):
-            decoder_output, decoder_hidden = decoder(
-                decoder_input, sec_hidden, decoder_hidden, encoder_outputs
-            )
-            # No teacher forcing: next input is decoder's own current output
-            _, topi = decoder_output.topk(1)
-            decoder_input = torch.LongTensor([[topi[i][0] for i in range(config.batch_size)]])
-            decoder_input = decoder_input.to(config.device)
-            # Calculate and accumulate loss
-            mask_loss, nTotal = maskNLLLoss(decoder_output, target_variable[t], mask[t])
-            loss += mask_loss
-            print_losses.append(mask_loss.item() * nTotal)
-            n_totals += nTotal
-
-    # Perform backpropatation
-    loss.backward()
-
-    # Clip gradients: gradients are modified in place
-    _ = torch.nn.utils.clip_grad_norm_(encoder.parameters(), config.clip)
-    _ = torch.nn.utils.clip_grad_norm_(sec_encoder.parameters(), config.clip)
-    _ = torch.nn.utils.clip_grad_norm_(decoder.parameters(), config.clip)
-
-    # Adjust model weights
-    encoder_optimizer.step()
-    sec_encoder_optimizer.step()
-    decoder_optimizer.step()
-
-    return sum(print_losses) / n_totals
-
-def trainIters(voc, pairs, wiki_strings, encoder, sec_encoder, decoder, encoder_optimizer, sec_encoder_optimizer, decoder_optimizer, embedding,save_dir):
-
-    # Load batches for each iteration
-    training_batch_generator = batchGenerator(voc,pairs,wiki_strings)
-
-    # Initializations
-    print('Initializing ...')
-    start_iteration = 1
-    print_loss = 0
-#     if config.loadFilename:
-#         start_iteration = checkpoint['iteration'] + 1
-
-    # Training loop
-    print("Training...")
-    for iteration in range(start_iteration, config.n_iteration + 1):
-        training_batch = next(training_batch_generator)
-        # Extract fields from batch
-        doc_input, doc_lengths, input_variable, lengths, target_variable, mask, max_target_len = training_batch
-        
-        #将doc按长度降序排列，并保存让其恢复原样的idx2
-        doc_lengths,idx1 = torch.sort(doc_lengths,descending=True)
-        doc_input = doc_input.index_select(1,idx1)
-        _,idx2 = torch.sort(idx1)
-        # Run a training iteration with batch
-        loss = train(input_variable, lengths, doc_input, doc_lengths, idx2, target_variable, mask, max_target_len, encoder,sec_encoder,decoder, embedding, encoder_optimizer,sec_encoder_optimizer, decoder_optimizer)
-        print_loss += loss
-
-        # Print progress
-        if iteration % config.print_every == 0:
-            print_loss_avg = print_loss / config.print_every
-            print("Iteration: {}; Percent complete: {:.1f}%; Average loss: {:.4f}".format(iteration, iteration / config.n_iteration * 100, print_loss_avg))
-            print_loss = 0
-
-        # Save checkpoint
-        if (iteration % config.save_every == 0):
-            directory = os.path.join(save_dir, config.model_name, '{}-{}_{}'.format(config.encoder_n_layers, config.decoder_n_layers, config.hidden_size))
-            if not os.path.exists(directory):
-                os.makedirs(directory)
-            torch.save({
-                'iteration': iteration,
-                'en': encoder.state_dict(),
-                'sec_en':sec_encoder.state_dict(),
-                'de': decoder.state_dict(),
-                'en_opt': encoder_optimizer.state_dict(),
-                'sec_en_opt': sec_encoder_optimizer.state_dict(),
-                'de_opt': decoder_optimizer.state_dict(),
-                'loss': loss,
-                'voc_dict': voc.__dict__,
-                'embedding': embedding.state_dict()
-            }, os.path.join(directory, '{}_{}.tar'.format(iteration, 'checkpoint')))

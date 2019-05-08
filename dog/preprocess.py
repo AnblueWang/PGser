@@ -10,36 +10,11 @@ import re
 import unicodedata
 import itertools
 import random
+from data_utils import normalizeString, unicodeToAscii
 
 
-# Turn a Unicode string to plain ASCII, thanks to
-# http://stackoverflow.com/a/518232/2809427
-def unicodeToAscii(s):
-    return ''.join(
-        c for c in unicodedata.normalize('NFD', s)
-        if unicodedata.category(c) != 'Mn'
-    )
 
-# Lowercase, trim, and remove non-letter characters
-def normalizeString(s):
-    s = unicodeToAscii(s.lower().strip())
-    s = re.sub(r"can't", r"can not", s)
-    s = re.sub(r"n't", r" not", s)
-    s = re.sub(r"'ve'", r" have", s)
-    s = re.sub(r"cannot", r"can not", s)
-    s = re.sub(r"what's", r"what is", s)
-    s = re.sub(r"that's",r"that is",s)
-    s = re.sub(r"'re", r" are", s)
-    s = re.sub(r"'d", r" would", s)
-    s = re.sub(r"'ll'", r" will", s)
-    s = re.sub(r" im ", r" i am ", s)
-    s = re.sub(r"'m", r" am", s)
-    s = re.sub(r"([.!?])", r" \1 ", s)
-    s = re.sub(r"[^a-zA-Z.!?0-9]+", r" ", s)
-    s = re.sub(r"\s+", r" ", s).strip()
-    return s
-
-def readConvsFile(path,file):
+def readConvsFile(conv_path,file):
     conv_file = open(os.path.join(conv_path,file))
     conv_data = json.load(conv_file)
     wikiIndex = conv_data['wikiDocumentIdx']
@@ -79,6 +54,12 @@ def saveNewConvs(read_path,save_path):
         index += 1
         
 if __name__ == '__main__':
-    read_path = '../Conversations/train'
-    save_path = '../Conversations/seq+att/train'
+#     read_path = '../Conversations/valid'
+#     save_path = '../Conversations/seq+att/valid'
+#     saveNewConvs(read_path,save_path) 
+    read_path = '../Conversations/valid'
+    save_path = '../Conversations/seq+att/valid'
+    saveNewConvs(read_path,save_path) 
+    read_path = '../Conversations/test'
+    save_path = '../Conversations/seq+att/test'
     saveNewConvs(read_path,save_path) 

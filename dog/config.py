@@ -7,34 +7,38 @@ EOS_token = 2  # End-of-sentence token
 UNK_token = 3  # Unkonw token
 
 use_cuda = torch.cuda.is_available()
+# use_cuda = False
 device = torch.device("cuda:1" if use_cuda else "cpu")
-beam_size = 5
-use_cuda = True
 
-data_path = '../Conversations/seq+att/train'
+
+conv_path = '../Conversations/seq+att'
+wiki_path = '../WikiData'
+save_dir = '../Conversations/seq+att/model'
+ckpt = None
+
 # Configure models
 model_name = 'cb_model'
 attn_model = 'dot'
 #attn_model = 'general'
 #attn_model = 'concat'
-MAX_HISTORY_LENGTH = 100 #Maximum history length 
-MAX_LENGTH = 25  # Maximum sentence length to consider
+MAX_HISTORY_LENGTH = 200 #Maximum history length 
+MAX_LENGTH = 30  # Maximum sentence length to consider
 MIN_COUNT = 2    # Minimum word count threshold for trimming
 hidden_size = 300
 embedding_size = 100
-encoder_n_layers = 2
-decoder_n_layers = 1
+encoder_num_layers = 2
+decoder_num_layers = 1
 dropout = 0.3
 batch_size = 64
-# Configure training/optimization
-clip = 20.0
-teacher_forcing_ratio = 0.7
-learning_rate = 0.0001
-decoder_learning_ratio = 3.0
-n_iteration = 30000
-print_every = 100
-save_every = 500
 
-# Set checkpoint to load from; set to None if starting from scratch
-# loadFilename = '../Conversations/seq+att/cb_model/2-1_300/25000_checkpoint.tar'
-checkpoint_iter = 4000
+# Configure training/optimization
+optimizer = 'Adam'
+grad_clip = 20.0
+teacher_forcing_ratio = 0.7
+lr = 0.0001
+num_epochs = 100
+log_steps = 100
+valid_steps = 400
+
+#Configure generator
+beam_size = 5

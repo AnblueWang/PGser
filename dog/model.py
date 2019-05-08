@@ -2,8 +2,10 @@ import json
 import os
 import torch
 import torch.nn as nn
+from torch.nn.utils import clip_grad_norm_
 from torch import optim
 import torch.nn.functional as F
+from train import maskNLLLoss
 import csv
 import pandas as pd
 import re
@@ -125,3 +127,154 @@ class LuongAttnDecoderRNN(nn.Module):
         output = F.softmax(output, dim=1)#(B,Out)
         # Return output and final hidden state
         return output, hidden #(B,Out) (layer,B,H)
+
+class Copy_seq2seq(nn.Module):
+    """docstring for Copy_seq2seq"""
+    def __init__(self, vocab_size,embedding_size,hidden_size,encoder_num_layers=1,decoder_num_layers=1,dropout=0.0,
+        attn_model='dot'):
+        super(Copy_seq2seq, self).__init__()
+
+        self.vocab_size = vocab_size
+        self.hidden_size = hidden_size
+        self.embedding_size = embedding_size
+        self.encoder_num_layers = encoder_num_layers
+        self.decoder_num_layers = decoder_num_layers
+        self.dropout = dropout
+        self.attn_model = attn_model
+
+        # Initialize word embeddings
+        embedding = nn.Embedding(self.vocab_size, self.embedding_size)
+
+        # Initialize encoder & decoder models
+        self.encoder = EncoderRNN(self.embedding_size,self.hidden_size, 
+            embedding, self.encoder_num_layers, self.dropout)
+        self.sec_encoder = EncoderRNN(self.embedding_size,self.hidden_size, 
+            embedding, self.encoder_num_layers, self.dropout)
+        self.decoder = LuongAttnDecoderRNN(self.attn_model, embedding,
+            self.embedding_size, self.encoder_num_layers,self.hidden_size, self.vocab_size,
+            self.decoder_num_layers, self.dropout)
+    
+    def encode(self, data_batch):
+        section_variable, sec_lengths, input_variable, lengths, _, _, _ = data_batch
+        
+        
+
+        # Set device options
+        input_variable = input_variable.to(config.device)
+        lengths = lengths.to(config.device)
+        section_variable = section_variable.to(config.device)
+        sec_lengths = sec_lengths.to(config.device)
+
+        #将doc按长度降序排列，并保存让其恢复原样的sec_idx
+        sec_lengths,idx1 = torch.sort(sec_lengths,descending=True)
+        section_variable = section_variable.index_select(1,idx1)
+        _,sec_idx = torch.sort(idx1)
+        # Run a training iteration with batch
+
+        
+        encoder_outputs, encoder_hidden = self.encoder(input_variable, lengths) # (L,B,H)  (layer*direc,B,H)
+        # Forward pass through encoder
+        sec_outputs, sec_hidden = self.sec_encoder(section_variable, sec_lengths) # (secL,B,H)  (layer*direc,B,H)
+        sec_hidden = sec_hidden.index_select(1,sec_idx) #调整回按utter长度排序的batch内顺序
+        
+        return sec_hidden, encoder_outputs, encoder_hidden
+
+    def decode(self, data_batch,sec_hidden,encoder_outputs,encoder_hidden):
+        _,_,_,_,target_variable, mask, max_target_len = data_batch
+
+        target_variable = target_variable.to(config.device)
+        mask = mask.to(config.device)
+
+        # Create initial decoder input (start with SOS tokens for each sentence)
+        decoder_input = torch.LongTensor([[config.SOS_token for _ in range(config.batch_size)]]) # (1,B)
+        decoder_input = decoder_input.to(config.device)
+
+        # Set initial decoder hidden state to the encoder's final hidden state
+        decoder_hidden = encoder_hidden[-self.decoder_num_layers:] #（layer,B,H)
+
+        # Determine if we are using teacher forcing this iteration
+        use_teacher_forcing = True if random.random() < config.teacher_forcing_ratio else False
+        
+        # Initialize variables
+        outputs = target_variable.new_zeros(
+            size=(max_target_len,config.batch_size,self.vocab_size),
+            dtype=torch.float)
+
+        # Forward batch of sequences through decoder one time step at a time
+        
+        for t in range(max_target_len):
+            decoder_output, decoder_hidden = self.decoder(
+                decoder_input, sec_hidden, decoder_hidden, encoder_outputs
+            )
+            if use_teacher_forcing:
+                # Teacher forcing: next input is current target
+                decoder_input = target_variable[t].view(1, -1)
+            else:
+                # No teacher forcing: next input is decoder's own current output
+                _, topi = decoder_output.topk(1)
+                decoder_input = torch.LongTensor([[topi[i][0] for i in range(config.batch_size)]])
+                decoder_input = decoder_input.to(config.device)
+
+            outputs[t] = decoder_output
+
+        return outputs
+
+    def forward(self, data_batch):
+        sec_hidden,encoder_outputs,encoder_hidden = self.encode(data_batch)
+#         print(sec_hidden.size())
+        out_prop_dist = self.decode(data_batch,sec_hidden,encoder_outputs,encoder_hidden)
+        return out_prop_dist
+
+    def compute_loss(self, out_prop_dist, target_variable, mask):
+        loss = 0
+        n_totals = 0
+        print_losses = []
+        # Calculate and accumulate loss
+        for t in range(len(out_prop_dist)):
+            mask_loss, nTotal = maskNLLLoss(out_prop_dist[t], target_variable[t], mask[t])
+            loss += mask_loss
+            print_losses.append(mask_loss.item() * nTotal)
+            n_totals += nTotal
+
+        return loss, sum(print_losses)/n_totals
+    
+    def iterate(self, data_batch, optimizer = None, grad_clip=None,is_training=False):
+        
+        out_prop_dist = self.forward(data_batch)
+        _,_,_,_,target_variable,mask,max_target_len = data_batch
+        target_variable = target_variable.to(config.device)
+        mask = mask.to(config.device)
+        loss, avg_losses = self.compute_loss(out_prop_dist,target_variable,mask)
+
+        if torch.isnan(loss):
+            raise ValueError("nan loss encountered")
+
+        if is_training:
+            assert optimizer is not None
+            optimizer.zero_grad()
+            loss.backward()
+            if grad_clip is not None and grad_clip > 0:
+                clip_grad_norm_(parameters=self.parameters(),
+                                max_norm=grad_clip)
+            optimizer.step()
+
+        return avg_losses
+
+    def save(self, filename):
+        """
+        save
+        """
+        torch.save(self.state_dict(), filename)
+        print("Saved model state to '{}'!".format(filename))
+
+    def load(self, filename):
+        """
+        load
+        """
+        if os.path.isfile(filename):
+            state_dict = torch.load(
+                filename, map_location=lambda storage, loc: storage)
+            self.load_state_dict(state_dict, strict=False)
+            print("Loaded model state from '{}'".format(filename))
+        else:
+            print("Invalid model state file: '{}'".format(filename))
